@@ -4,5 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["std"] }
+chrono-tz = { version = "0.10.4", features = ["case-insensitive"] }
 fancy-regex = "0.20.2"
 regex = "1.13.2"
