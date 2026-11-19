@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: digest-rs
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: digest-rs
+
+      - name: 포맷 검사
+        run: cargo fmt --check
+
+      # digest-rs/CLAUDE.md 규칙: clippy 경고 0개 유지
+      - name: clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: 테스트
+        run: cargo test --locked
