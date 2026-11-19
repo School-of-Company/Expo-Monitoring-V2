@@ -169,9 +169,17 @@ pub fn same_key(a: &Value, b: &Value) -> bool {
 }
 
 /// An insertion-ordered `Map` with JS key equality: `set` keeps the first position and the last value.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct JsMap<V> {
     pub entries: Vec<(Value, V)>,
+}
+
+impl<V> Default for JsMap<V> {
+    fn default() -> Self {
+        JsMap {
+            entries: Vec::new(),
+        }
+    }
 }
 
 impl<V> JsMap<V> {
