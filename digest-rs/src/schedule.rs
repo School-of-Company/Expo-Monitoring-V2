@@ -6,7 +6,7 @@ use chrono::{DateTime, Datelike, Days, FixedOffset, NaiveDate, Offset, TimeZone,
 use chrono_tz::Tz;
 use std::sync::LazyLock;
 
-use crate::config::js_trim;
+use crate::js::js_trim;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Spec {

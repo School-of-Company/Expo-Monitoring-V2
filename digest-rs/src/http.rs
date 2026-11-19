@@ -28,7 +28,7 @@ impl FetchError {
     pub fn source(msg: impl Into<String>) -> Self {
         FetchError::Source(msg.into())
     }
-    fn type_error(code: Option<&str>) -> Self {
+    pub fn type_error(code: Option<&str>) -> Self {
         FetchError::Network {
             name: "TypeError",
             code: code.map(str::to_string),
