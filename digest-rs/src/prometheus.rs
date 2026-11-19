@@ -1,8 +1,10 @@
 // Port of digest/prometheus.mjs (parsing part; the HTTP collection comes with the report step).
 use serde_json::{Value, json};
 
-use crate::http::FetchError;
-use crate::js::{JsMap, get, index, nullish, to_js_string, to_number};
+use crate::config::Config;
+use crate::http::{DEFAULT_TIMEOUT, FetchError, get_json};
+use crate::js::{JsMap, get, index, nullish, search_params, to_js_string, to_number};
+use crate::report::{OutboxRow, PromAlert, PromData};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sample {
@@ -123,6 +125,99 @@ pub fn totals_of(services: &[ServiceRow]) -> Totals {
         errors,
         err_ratio: (requests > 0.0).then(|| errors / requests),
     }
+}
+
+async fn query(
+    client: &reqwest::Client,
+    base: &str,
+    time: &str,
+    expr: &str,
+) -> Result<Vec<Sample>, FetchError> {
+    let url = format!(
+        "{base}/api/v1/query?{}",
+        search_params(&[("query", expr), ("time", time)])
+    );
+    parse_vector(&get_json(client, &url, &[], DEFAULT_TIMEOUT).await?)
+}
+
+/// JS `collectPrometheus`: 5 required queries (first failure wins, like `Promise.all`), then 4 optional ones.
+pub async fn collect(
+    client: &reqwest::Client,
+    cfg: &Config,
+    end_ms: i64,
+    window_sec: i64,
+) -> Result<PromData, FetchError> {
+    let base = cfg
+        .prometheus_url
+        .strip_suffix('/')
+        .unwrap_or(&cfg.prometheus_url);
+    let time = crate::report::to_fixed(end_ms as f64 / 1000.0, 3);
+    let q = |expr: String| {
+        let time = time.clone();
+        async move { query(client, base, &time, &expr).await }
+    };
+    let w = format!("{window_sec}s");
+    let (requests, errors, p95, up_total, up_count) = tokio::try_join!(
+        q(format!(
+            "sum by (service) (increase(http_server_requests_seconds_count[{w}])) or sum by (service) (increase(gateway_http_requests_total[{w}]))"
+        )),
+        q(format!(
+            "sum by (service) (increase(http_server_requests_seconds_count{{status=~\"5..\"}}[{w}])) or sum by (service) (increase(gateway_http_requests_total{{status=~\"5..\"}}[{w}]))"
+        )),
+        q(format!(
+            "histogram_quantile(0.95, sum by (service, le) (rate(http_server_requests_seconds_bucket[{w}]))) or histogram_quantile(0.95, sum by (service, le) (rate(gateway_http_request_duration_seconds_bucket[{w}])))"
+        )),
+        q("count by (service) (up{job=\"eureka-services\"})".to_string()),
+        q("count by (service) (up{job=\"eureka-services\"} == 1)".to_string()),
+    )?;
+    let optional = |expr: String| {
+        let q = q(expr);
+        async move { q.await.unwrap_or_default() }
+    };
+    let (outbox, outbox_age, pool_waiting, alerts) = tokio::join!(
+        optional("sum by (status) (form_outbox_records)".to_string()),
+        optional(format!(
+            "max(max_over_time(form_outbox_oldest_pending_age_seconds[{w}]))"
+        )),
+        optional(format!(
+            "max(max_over_time(form_db_pool_connections{{state=\"waiting\"}}[{w}]))"
+        )),
+        optional(format!(
+            "max by (alertname, severity) (max_over_time(ALERTS{{alertstate=\"firing\"}}[{w}]))"
+        )),
+    );
+    let services = merge_services(&Series {
+        requests: &requests,
+        errors: &errors,
+        p95: &p95,
+        up_total: &up_total,
+        up_count: &up_count,
+    });
+    let label = |s: &Sample, k: &str, d: &str| {
+        nullish(get(&s.labels, k))
+            .cloned()
+            .unwrap_or_else(|| json!(d))
+    };
+    Ok(PromData {
+        totals: totals_of(&services),
+        services,
+        outbox: outbox
+            .iter()
+            .map(|r| OutboxRow {
+                status: label(r, "status", ""),
+                count: r.value,
+            })
+            .collect(),
+        outbox_age: outbox_age.first().map(|r| r.value),
+        pool_waiting: pool_waiting.first().map(|r| r.value),
+        alerts: alerts
+            .iter()
+            .map(|r| PromAlert {
+                name: label(r, "alertname", "?"),
+                severity: label(r, "severity", ""),
+            })
+            .collect(),
+    })
 }
 
 #[cfg(test)]

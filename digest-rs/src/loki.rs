@@ -4,8 +4,12 @@ use std::sync::LazyLock;
 
 use serde_json::{Value, json};
 
-use crate::http::FetchError;
-use crate::js::{get, index, is_js_space, js_trim, nullish, slice_end, to_js_string};
+use crate::config::Config;
+use crate::http::{DEFAULT_TIMEOUT, FetchError, get_json};
+use crate::js::{
+    get, index, is_js_space, js_trim, nullish, number_to_string, search_params, slice_end,
+    to_js_string,
+};
 use crate::mask::{JS_SPACE, mask, truncate};
 
 /// Message used for grouping: JSON "message"/"msg"/"error"/"err" field if it is a string, else the first line.
@@ -136,6 +140,34 @@ pub fn parse_streams(body: &Value, log_top_n: f64, limit: f64) -> Result<LokiSum
         groups,
         sampled: lines as f64 >= limit,
     })
+}
+
+/// JS `collectLoki`: newest `limit` lines of the window (nanosecond bounds), grouped.
+pub async fn collect(
+    client: &reqwest::Client,
+    cfg: &Config,
+    end_ms: i64,
+    window_sec: i64,
+) -> Result<LokiSummary, FetchError> {
+    let start = number_to_string((end_ms - window_sec * 1000) as f64 * 1e6);
+    let end = number_to_string(end_ms as f64 * 1e6);
+    let limit = number_to_string(cfg.loki_limit);
+    let params = search_params(&[
+        ("query", &cfg.loki_query),
+        ("start", &start),
+        ("end", &end),
+        ("limit", &limit),
+        ("direction", "backward"),
+    ]);
+    let base = cfg.loki_url.strip_suffix('/').unwrap_or(&cfg.loki_url);
+    let body = get_json(
+        client,
+        &format!("{base}/loki/api/v1/query_range?{params}"),
+        &[],
+        DEFAULT_TIMEOUT,
+    )
+    .await?;
+    parse_streams(&body, cfg.log_top_n, cfg.loki_limit)
 }
 
 #[cfg(test)]

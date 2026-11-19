@@ -119,6 +119,90 @@ pub struct Data {
     pub dry_run: bool,
 }
 
+const DAY: i64 = 86_400;
+
+/// JS `collectAll`: every source in parallel, each failure isolated into its own `Collected`.
+pub async fn collect_all(
+    client: &reqwest::Client,
+    cfg: &Config,
+    kind: Kind,
+    now: i64,
+    dry_run: bool,
+) -> Data {
+    use crate::{grafana, loki, prometheus};
+    let window_sec = if kind == Kind::Weekly { 7 * DAY } else { DAY };
+    let (from_ms, to_ms) = (now - window_sec * 1000, now);
+    let grafana_on = !cfg.grafana_url.is_empty();
+    let prom_on = !cfg.prometheus_url.is_empty();
+    let (prom, prev, alerts, deploys, snapshot, images, loki) = tokio::join!(
+        async {
+            if prom_on {
+                settle(prometheus::collect(client, cfg, now, window_sec).await)
+            } else {
+                Collected::Failed("PROMETHEUS_URL 미설정".to_string())
+            }
+        },
+        when(
+            prom_on && kind == Kind::Weekly,
+            prometheus::collect(client, cfg, from_ms, window_sec)
+        ),
+        when(
+            grafana_on,
+            grafana::collect_alerts(client, cfg, from_ms, to_ms)
+        ),
+        when(
+            grafana_on,
+            grafana::collect_deploys(client, cfg, from_ms, to_ms)
+        ),
+        when(
+            grafana_on && !dry_run,
+            grafana::create_snapshot(client, cfg, from_ms, to_ms)
+        ),
+        when(
+            grafana_on && !cfg.panel_ids.is_empty(),
+            grafana::render_panels(client, cfg, from_ms, to_ms)
+        ),
+        when(
+            !cfg.loki_url.is_empty(),
+            loki::collect(client, cfg, now, window_sec)
+        ),
+    );
+    Data {
+        kind,
+        now,
+        from_ms,
+        to_ms,
+        prom,
+        prev,
+        alerts,
+        deploys,
+        snapshot,
+        images,
+        loki,
+        dry_run,
+    }
+}
+
+/// JS `settle`: `{value}` or `{error: describeError(e)}`.
+fn settle<T>(r: Result<T, crate::http::FetchError>) -> Collected<T> {
+    match r {
+        Ok(v) => Collected::Ok(v),
+        Err(e) => Collected::Failed(e.to_string()),
+    }
+}
+
+/// Run the source only when enabled; otherwise `{skipped: true}` (the future is dropped unpolled).
+async fn when<T>(
+    enabled: bool,
+    fut: impl std::future::Future<Output = Result<T, crate::http::FetchError>>,
+) -> Collected<T> {
+    if enabled {
+        settle(fut.await)
+    } else {
+        Collected::Skipped
+    }
+}
+
 // ---- formatting -----------------------------------------------------------
 
 /// JS `Math.round`: halves go toward +Infinity, and -0 survives.
@@ -1029,6 +1113,365 @@ mod tests {
         assert_eq!(
             fmt_time(Some(0), "Nope"),
             Err("Invalid time zone specified: Nope".into())
+        );
+    }
+}
+
+#[cfg(test)]
+mod collect_tests {
+    use super::*;
+    use crate::config::load_config;
+    use crate::testutil::{Req, Resp, json, raw, serve};
+    use serde_json::{Value, json as j};
+
+    fn vec_body(rows: &[(&str, f64)]) -> Value {
+        j!({"status": "success", "data": {"resultType": "vector", "result": rows.iter().map(|(s, v)| j!({"metric": {"service": s}, "value": [1, v.to_string()]})).collect::<Vec<_>>()}})
+    }
+
+    /// sources.test.mjs fakeFetch: one Prometheus/Grafana/Loki each; `fail` makes that server answer 500.
+    fn prom(fail: bool) -> impl Fn(&Req) -> Resp {
+        move |r| {
+            if fail {
+                return json(500, j!({}));
+            }
+            let q = r.query("query").unwrap_or_default();
+            let body = if q
+                .starts_with("sum by (service) (increase(http_server_requests_seconds_count{")
+            {
+                vec_body(&[("expo-form", 30.0)])
+            } else if q.starts_with("sum by (service) (increase") {
+                vec_body(&[("expo-form", 1000.0)])
+            } else if q.starts_with("histogram") {
+                vec_body(&[("expo-form", 0.5)])
+            } else if q.starts_with("count by") {
+                vec_body(&[("expo-form", 2.0)])
+            } else {
+                vec_body(&[])
+            };
+            json(200, body)
+        }
+    }
+    fn grafana(fail: bool) -> impl Fn(&Req) -> Resp {
+        move |r| {
+            if fail {
+                return json(500, j!({}));
+            }
+            match r.path() {
+                p if p.contains("/rules") => {
+                    json(200, j!({"status": "success", "data": {"groups": []}}))
+                }
+                p if p.contains("/annotations") => json(200, j!([])),
+                p if p.starts_with("/render") => raw(200, "image/png", &[1, 2, 3]),
+                _ => json(404, j!({})),
+            }
+        }
+    }
+    fn loki(fail: bool) -> impl Fn(&Req) -> Resp {
+        move |_| {
+            if fail {
+                json(500, j!({}))
+            } else {
+                json(
+                    200,
+                    j!({"status": "success", "data": {"resultType": "streams", "result": []}}),
+                )
+            }
+        }
+    }
+
+    async fn setup(
+        fail_prom: bool,
+        fail_graf: bool,
+        fail_loki: bool,
+    ) -> (Config, [crate::testutil::Server; 3]) {
+        let (p, g, l) = (
+            serve(prom(fail_prom)).await,
+            serve(grafana(fail_graf)).await,
+            serve(loki(fail_loki)).await,
+        );
+        let pairs = [
+            ("PROMETHEUS_URL", p.url.clone()),
+            ("GRAFANA_URL", g.url.clone()),
+            ("GRAFANA_TOKEN", "tok".to_string()),
+            ("LOKI_URL", l.url.clone()),
+        ];
+        (
+            load_config(|k| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == k)
+                    .map(|(_, v)| v.clone())
+            }),
+            [p, g, l],
+        )
+    }
+
+    fn field<'a>(r: &'a Report, name: &str) -> Option<&'a str> {
+        r.fields
+            .iter()
+            .find(|f| f.name == name)
+            .map(|f| f.value.as_str())
+    }
+
+    // ---- sources.test.mjs ----
+    #[tokio::test]
+    async fn one_source_failing_replaces_only_its_section() {
+        let (cfg, _s) = setup(false, true, true).await;
+        let data = collect_all(
+            &crate::http::client().unwrap(),
+            &cfg,
+            Kind::Daily,
+            1_761_000_000_000,
+            true,
+        )
+        .await;
+        let r = build_report(&data, &cfg).unwrap();
+        assert!(field(&r, "5xx 비율 상위 5").is_some());
+        assert!(
+            field(&r, "오류 로그")
+                .unwrap()
+                .contains("Loki: 수집 실패(HTTP 500)")
+        );
+        assert!(
+            field(&r, "알림")
+                .unwrap()
+                .contains("Grafana 알림: 수집 실패(HTTP 500)")
+        );
+        assert!(r.description.contains("주의")); // 3% 5xx > 1%
+    }
+
+    #[tokio::test]
+    async fn prometheus_failure_keeps_the_other_sections() {
+        let (cfg, _s) = setup(true, false, false).await;
+        let data = collect_all(
+            &crate::http::client().unwrap(),
+            &cfg,
+            Kind::Daily,
+            1_761_000_000_000,
+            true,
+        )
+        .await;
+        let r = build_report(&data, &cfg).unwrap();
+        assert!(
+            field(&r, "Prometheus")
+                .unwrap()
+                .contains("수집 실패(HTTP 500)")
+        );
+        assert!(
+            r.fields
+                .iter()
+                .any(|f| f.name.starts_with("오류 로그 유형"))
+        );
+        assert_eq!(r.images.len(), 2);
+    }
+
+    // ---- request shapes (strings copied from digest/*.mjs) ----
+    #[tokio::test]
+    async fn prometheus_queries_time_and_loki_params() {
+        let (cfg, [p, _g, l]) = setup(false, false, false).await;
+        let data = collect_all(
+            &crate::http::client().unwrap(),
+            &cfg,
+            Kind::Weekly,
+            1_761_000_000_123,
+            true,
+        )
+        .await;
+        assert!(matches!(data.prev, Collected::Ok(_)));
+        let mut queries: Vec<(String, String)> = p
+            .requests()
+            .iter()
+            .map(|r| (r.query("query").unwrap(), r.query("time").unwrap()))
+            .collect();
+        queries.sort();
+        let w = "604800s";
+        let mut want: Vec<String> = vec![
+            format!(
+                "sum by (service) (increase(http_server_requests_seconds_count[{w}])) or sum by (service) (increase(gateway_http_requests_total[{w}]))"
+            ),
+            format!(
+                "sum by (service) (increase(http_server_requests_seconds_count{{status=~\"5..\"}}[{w}])) or sum by (service) (increase(gateway_http_requests_total{{status=~\"5..\"}}[{w}]))"
+            ),
+            format!(
+                "histogram_quantile(0.95, sum by (service, le) (rate(http_server_requests_seconds_bucket[{w}]))) or histogram_quantile(0.95, sum by (service, le) (rate(gateway_http_request_duration_seconds_bucket[{w}])))"
+            ),
+            "count by (service) (up{job=\"eureka-services\"})".to_string(),
+            "count by (service) (up{job=\"eureka-services\"} == 1)".to_string(),
+            "sum by (status) (form_outbox_records)".to_string(),
+            format!("max(max_over_time(form_outbox_oldest_pending_age_seconds[{w}]))"),
+            format!("max(max_over_time(form_db_pool_connections{{state=\"waiting\"}}[{w}]))"),
+            format!(
+                "max by (alertname, severity) (max_over_time(ALERTS{{alertstate=\"firing\"}}[{w}]))"
+            ),
+        ];
+        // this week and the week before
+        let mut all: Vec<(String, String)> = want
+            .iter()
+            .map(|q| (q.clone(), "1761000000.123".to_string()))
+            .chain(
+                want.iter()
+                    .map(|q| (q.clone(), "1760395200.123".to_string())),
+            )
+            .collect();
+        all.sort();
+        assert_eq!(queries, all);
+        want.clear();
+        let lr = &l.requests()[0];
+        assert_eq!(lr.path(), "/loki/api/v1/query_range");
+        assert_eq!(
+            lr.target.split_once('?').unwrap().1,
+            "query=%7Blevel%3D%22ERROR%22%7D&start=1760395200123000000&end=1761000000123000000&limit=1000&direction=backward"
+        );
+    }
+
+    #[tokio::test]
+    async fn required_query_failure_wins_and_optional_failure_is_empty() {
+        let p = serve(|r: &Req| {
+            let q = r.query("query").unwrap_or_default();
+            if q.contains("form_outbox_records") {
+                json(500, j!({}))
+            } else if q.starts_with("histogram") {
+                json(200, j!({"status": "error"}))
+            } else {
+                json(200, vec_body(&[("a", 1.0)]))
+            }
+        })
+        .await;
+        let cfg = load_config(|k| (k == "PROMETHEUS_URL").then(|| p.url.clone()));
+        let client = crate::http::client().unwrap();
+        assert_eq!(
+            crate::prometheus::collect(&client, &cfg, 0, 60)
+                .await
+                .err()
+                .map(|e| e.to_string()),
+            Some("응답 형식 오류".to_string())
+        );
+        let p2 = serve(|r: &Req| {
+            if r.query("query")
+                .unwrap_or_default()
+                .contains("form_outbox_records")
+            {
+                json(500, j!({}))
+            } else {
+                json(200, vec_body(&[("a", 1.0)]))
+            }
+        })
+        .await;
+        let cfg = load_config(|k| (k == "PROMETHEUS_URL").then(|| p2.url.clone()));
+        let d = crate::prometheus::collect(&client, &cfg, 0, 60)
+            .await
+            .unwrap();
+        assert!(d.outbox.is_empty());
+        assert_eq!(d.outbox_age, Some(1.0));
+    }
+
+    // ---- Grafana snapshot and render (verify-digest.mjs fixtures) ----
+    #[tokio::test]
+    async fn snapshot_fills_vars_and_stays_local() {
+        let g = serve(|r: &Req| match r.path() {
+            "/api/dashboards/uid/msa-overview" => json(200, j!({"dashboard": {"uid": "msa-overview", "title": "x", "templating": {"list": [{"name": "service", "allValue": ".+"}]},
+                "panels": [
+                    {"id": 7, "type": "timeseries", "datasource": {"type": "prometheus", "uid": "prometheus"}, "targets": [{"refId": "A", "expr": "x{service=~\"$service\"} ${service}"}], "w": 1.0},
+                    {"id": 8, "type": "row", "targets": [{"expr": "y"}]},
+                    {"id": 9, "targets": [{"refId": "B", "expr": "fail"}]},
+                    {"id": 10, "targets": []}
+                ], "timepicker": {"hidden": false, "refresh": ["5s"]}}})),
+            "/api/ds/query" => {
+                if r.json()["queries"][0]["expr"] == "fail" { json(500, j!({})) } else { json(200, j!({"results": {"A": {"frames": [{"schema": {"refId": "A"}}]}}})) }
+            }
+            "/api/snapshots" => json(200, j!({"key": "snap key", "url": "http://internal/x"})),
+            _ => json(404, j!({})),
+        })
+        .await;
+        let pairs = [
+            ("GRAFANA_URL", format!("{}/", g.url)),
+            ("GRAFANA_PUBLIC_URL", "https://pub".to_string()),
+            ("GRAFANA_TOKEN", "glsa".to_string()),
+        ];
+        let cfg = load_config(|k| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.clone())
+        });
+        let snap = crate::grafana::create_snapshot(
+            &crate::http::client().unwrap(),
+            &cfg,
+            1_761_000_000_000,
+            1_761_086_400_000,
+        )
+        .await
+        .unwrap();
+        assert_eq!(snap.url, "https://pub/dashboard/snapshot/snap%20key");
+        let reqs = g.requests();
+        let ds: Vec<&Req> = reqs
+            .iter()
+            .filter(|r| r.path() == "/api/ds/query")
+            .collect();
+        assert_eq!(ds.len(), 2);
+        assert_eq!(ds[0].header("authorization"), Some("Bearer glsa"));
+        assert_eq!(ds[0].header("content-type"), Some("application/json"));
+        assert_eq!(
+            String::from_utf8_lossy(&ds[0].body),
+            r#"{"queries":[{"refId":"A","datasource":{"type":"prometheus","uid":"prometheus"},"expr":"x{service=~\".+\"} .+","range":true,"instant":false,"intervalMs":288000,"maxDataPoints":300}],"from":"1761000000000","to":"1761086400000"}"#
+        );
+        let snap_body = reqs.iter().find(|r| r.path() == "/api/snapshots").unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&snap_body.body),
+            r#"{"dashboard":{"uid":"msa-overview","title":"x","templating":{"list":[{"name":"service","allValue":".+"}]},"panels":[{"id":7,"type":"timeseries","datasource":{"type":"prometheus","uid":"prometheus"},"targets":[],"w":1,"snapshotData":[{"schema":{"refId":"A"}}]},{"id":8,"type":"row","targets":[{"expr":"y"}]},{"id":9,"targets":[{"refId":"B","expr":"fail"}]},{"id":10,"targets":[]}],"timepicker":{"hidden":true,"refresh":["5s"]},"time":{"from":"2025-10-20T22:40:00.000Z","to":"2025-10-21T22:40:00.000Z"}},"name":"digest 2025-10-21","expires":604800,"external":false}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn render_checks_png_and_reports_partial_failures() {
+        let g = serve(|r: &Req| match r.query("panelId").as_deref() {
+            Some("8") => raw(200, "image/png", b"PNG"),
+            Some("10") => raw(200, "text/html", b"<html>"),
+            _ => json(500, j!({})),
+        })
+        .await;
+        let pairs = [
+            ("GRAFANA_URL", g.url.clone()),
+            ("DIGEST_DASHBOARD_UID", "a/b".to_string()),
+        ];
+        let cfg = load_config(|k| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.clone())
+        });
+        let client = crate::http::client().unwrap();
+        let imgs = crate::grafana::render_panels(&client, &cfg, 1, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            imgs.images
+                .iter()
+                .map(|i| (i.name.as_str(), i.buffer.len()))
+                .collect::<Vec<_>>(),
+            vec![("panel-8.png", 3)]
+        );
+        assert_eq!(imgs.failures, vec!["panel 10: PNG 아님"]);
+        assert_eq!(
+            g.requests()[0].target,
+            "/render/d-solo/a%2Fb/a%2Fb?orgId=1&panelId=8&from=1&to=2&width=900&height=380&theme=light&tz=Asia%2FSeoul"
+        );
+        let pairs = [
+            ("GRAFANA_URL", g.url.clone()),
+            ("DIGEST_PANEL_IDS", "3,4".to_string()),
+        ];
+        let cfg = load_config(|k| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == k)
+                .map(|(_, v)| v.to_string())
+        });
+        assert_eq!(
+            crate::grafana::render_panels(&client, &cfg, 1, 2)
+                .await
+                .err()
+                .map(|e| e.to_string()),
+            Some("panel 3: HTTP 500".to_string())
         );
     }
 }
