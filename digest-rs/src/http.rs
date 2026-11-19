@@ -83,8 +83,10 @@ pub fn scrub(text: &str, secrets: &[&str]) -> String {
 }
 
 /// One shared client: undici's connect timeout and redirect limit (20).
+/// Proxy env vars (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY) are ignored, as Node's fetch does by default.
 pub fn client() -> Result<reqwest::Client, FetchError> {
     reqwest::Client::builder()
+        .no_proxy()
         .connect_timeout(CONNECT_TIMEOUT)
         .redirect(reqwest::redirect::Policy::limited(20))
         .build()
