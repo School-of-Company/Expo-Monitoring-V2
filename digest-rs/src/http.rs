@@ -169,13 +169,7 @@ pub async fn get_json(
     for (k, v) in headers {
         req = req.header(*k, v);
     }
-    let res = req.send().await.map_err(|e| {
-        if e.is_builder() {
-            FetchError::type_error(None)
-        } else {
-            classify(&e)
-        }
-    })?;
+    let res = send(req).await?;
     if !res.status().is_success() {
         return Err(FetchError::Source(format!(
             "HTTP {}",
@@ -187,6 +181,34 @@ pub async fn get_json(
         .await
         .map_err(|_| FetchError::source("응답 형식 오류"))?;
     parse_json(&body)
+}
+
+/// `fetch(...)` rejection mapping for any request.
+pub async fn send(req: reqwest::RequestBuilder) -> Result<reqwest::Response, FetchError> {
+    req.send().await.map_err(|e| {
+        if e.is_builder() {
+            FetchError::type_error(None)
+        } else {
+            classify(&e)
+        }
+    })
+}
+
+/// `res.arrayBuffer()` / the read half of `res.json()`: a stalled or broken body rejects like the fetch would.
+pub async fn read_body(res: reqwest::Response) -> Result<Vec<u8>, FetchError> {
+    res.bytes()
+        .await
+        .map(|b| b.to_vec())
+        .map_err(|e| classify(&e))
+}
+
+/// `await res.json()` outside `getJson`: unreadable body as above, invalid JSON is a SyntaxError.
+pub async fn res_json(res: reqwest::Response) -> Result<Value, FetchError> {
+    let body = read_body(res).await?;
+    parse_json(&body).map_err(|_| FetchError::Network {
+        name: "SyntaxError",
+        code: None,
+    })
 }
 
 #[cfg(test)]

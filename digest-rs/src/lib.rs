@@ -9,3 +9,5 @@ pub mod mask;
 pub mod prometheus;
 pub mod report;
 pub mod schedule;
+#[cfg(test)]
+pub mod testutil;

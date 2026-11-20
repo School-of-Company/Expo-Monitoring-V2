@@ -197,6 +197,36 @@ impl<V> JsMap<V> {
     }
 }
 
+/// A JS number as `JSON.stringify` writes it: integral values without `.0`, NaN/±Infinity as null.
+// shortcut: integral values past ±9.2e18 stay f64, so serde prints 1e21 as "1e21" where JS writes "1e+21".
+pub fn num_value(x: f64) -> Value {
+    if !x.is_finite() {
+        Value::Null
+    } else if x.fract() == 0.0 && x.abs() < 9.2e18 {
+        Value::from(x as i64)
+    } else {
+        Value::from(x)
+    }
+}
+
+/// Re-encode every number the way JS holds it (a double), e.g. `1.0` -> `1`, before sending JSON back out.
+pub fn js_normalize(v: &mut Value) {
+    match v {
+        Value::Number(n) => *v = num_value(n.as_f64().unwrap_or(f64::NAN)),
+        Value::Array(a) => a.iter_mut().for_each(js_normalize),
+        Value::Object(m) => m.values_mut().for_each(js_normalize),
+        _ => {}
+    }
+}
+
+/// `new Date(ms).toISOString()`.
+pub fn iso_string(ms: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms).map_or_else(
+        || "Invalid Date".to_string(),
+        |d| d.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+    )
+}
+
 /// JS `Number.prototype.toString()` (shortest round-trip digits, exponent past 1e21 / below 1e-6).
 pub fn number_to_string(x: f64) -> String {
     if x.is_nan() {
@@ -376,6 +406,16 @@ mod tests {
         assert_eq!(get(&json!({"1": 9}), "1"), Some(&json!(9)));
         assert_eq!(get(&json!([1, 2]), "01"), None);
         assert_eq!(get(&json!("ab"), "service"), None);
+    }
+
+    #[test]
+    fn json_numbers_and_dates_like_js() {
+        let mut v =
+            serde_json::from_str::<Value>(r#"{"a":1.0,"b":[2.5,-0.0,7],"c":604800}"#).unwrap();
+        js_normalize(&mut v);
+        assert_eq!(v.to_string(), r#"{"a":1,"b":[2.5,0,7],"c":604800}"#);
+        assert_eq!(num_value(f64::NAN), Value::Null);
+        assert_eq!(iso_string(1_761_000_000_123), "2025-10-20T22:40:00.123Z");
     }
 
     #[test]
