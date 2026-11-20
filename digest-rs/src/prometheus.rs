@@ -1,4 +1,6 @@
 // Port of digest/prometheus.mjs (parsing part; the HTTP collection comes with the report step).
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use serde_json::{Value, json};
 
 use crate::config::Config;
@@ -127,6 +129,20 @@ pub fn totals_of(services: &[ServiceRow]) -> Totals {
     }
 }
 
+/// Results tagged with completion order -> all values, or the earliest error.
+fn first_error<T: Default, const N: usize>(
+    rs: [(usize, Result<T, FetchError>); N],
+) -> Result<[T; N], FetchError> {
+    let first = rs
+        .iter()
+        .filter_map(|(n, r)| r.as_ref().err().map(|e| (*n, e)))
+        .min_by_key(|(n, _)| *n);
+    if let Some((_, e)) = first {
+        return Err(e.clone());
+    }
+    Ok(rs.map(|(_, r)| r.unwrap_or_default()))
+}
+
 async fn query(
     client: &reqwest::Client,
     base: &str,
@@ -157,19 +173,29 @@ pub async fn collect(
         async move { query(client, base, &time, &expr).await }
     };
     let w = format!("{window_sec}s");
-    let (requests, errors, p95, up_total, up_count) = tokio::try_join!(
-        q(format!(
+    // Like Promise.all: nothing is cancelled, and the failure that happened first in time wins.
+    let order = AtomicUsize::new(0);
+    let timed = |expr: String| {
+        let (fut, order) = (q(expr), &order);
+        async move {
+            let r = fut.await;
+            (order.fetch_add(1, Ordering::SeqCst), r)
+        }
+    };
+    let (a, b, c, d, e) = tokio::join!(
+        timed(format!(
             "sum by (service) (increase(http_server_requests_seconds_count[{w}])) or sum by (service) (increase(gateway_http_requests_total[{w}]))"
         )),
-        q(format!(
+        timed(format!(
             "sum by (service) (increase(http_server_requests_seconds_count{{status=~\"5..\"}}[{w}])) or sum by (service) (increase(gateway_http_requests_total{{status=~\"5..\"}}[{w}]))"
         )),
-        q(format!(
+        timed(format!(
             "histogram_quantile(0.95, sum by (service, le) (rate(http_server_requests_seconds_bucket[{w}]))) or histogram_quantile(0.95, sum by (service, le) (rate(gateway_http_request_duration_seconds_bucket[{w}])))"
         )),
-        q("count by (service) (up{job=\"eureka-services\"})".to_string()),
-        q("count by (service) (up{job=\"eureka-services\"} == 1)".to_string()),
-    )?;
+        timed("count by (service) (up{job=\"eureka-services\"})".to_string()),
+        timed("count by (service) (up{job=\"eureka-services\"} == 1)".to_string()),
+    );
+    let [requests, errors, p95, up_total, up_count] = first_error([a, b, c, d, e])?;
     let optional = |expr: String| {
         let q = q(expr);
         async move { q.await.unwrap_or_default() }
@@ -274,6 +300,20 @@ mod tests {
         assert_eq!(find("a").p95, Some(0.4));
         assert_eq!(find("b").p95, None);
         assert_eq!(find("a").instances_up, 1.0);
+    }
+
+    #[test]
+    fn earliest_failure_wins() {
+        let e = |m: &str| Err::<Vec<Sample>, _>(FetchError::source(m));
+        assert_eq!(
+            first_error([(2, e("late")), (0, Ok(vec![])), (1, e("early"))]),
+            Err(FetchError::source("early"))
+        );
+        assert_eq!(
+            first_error([(0, Ok::<Vec<Sample>, FetchError>(vec![])), (1, Ok(vec![]))])
+                .map(|r| r.len()),
+            Ok(2)
+        );
     }
 
     // ---- JS value edges, expected from Node ----

@@ -15,8 +15,8 @@ School-of-Company/Expo-Monitoring의 `digest/`(Node 22 ESM)를 기능·출력·�
 
 ## parity
 - Node는 수정하지 않는다. parity 스크립트는 Expo-Monitoring 경로를 받아(로컬은 환경변수, CI는 두 번째 checkout) 같은 가짜 서버로 Node와 Rust를 실행해 비교한다.
-- Rust만 테스트용 `DIGEST_NOW_MS`로 시각을 고정하고, 같은 분 안에서 실행한 뒤 시각 의존 부분(기간, 링크 from/to, 나노초 범위, 스냅샷 이름)을 정규화해 비교한다.
-- 배포 파일(Dockerfile, compose 오버레이, CI, README)은 이 레포에 새로 만든다.
+- Node가 Prometheus `time` 파라미터로 남긴 실행 시각을 읽어 Rust의 테스트용 `DIGEST_NOW_MS`(once만)로 넘기고, 정규화 없이 바이트 단위로 비교한다 (`dev/verify-digest-parity.mjs`).
+- 배포 파일: `digest-rs/Dockerfile`, 루트 `docker-compose.digest-rs.yml`, `.github/workflows/ci.yml`의 `parity`·`docker` job, `digest-rs/README.md`.
 
 ## 이식 함정 (반드시 처리)
 - 문자열 길이·자르기는 UTF-16 코드 유닛 기준. 이모지가 반으로 잘리면 JSON(dry-run·전송 모두)은 `\udXXX` 이스케이프(`discord::to_js_json`), stdout에 그대로 쓰는 마크다운은 U+FFFD로 Node와 동일하게.
