@@ -72,7 +72,7 @@ pub fn mask(text: &str) -> String {
 /// A high surrogate left alone by a JS `slice` cut. Rust strings cannot hold it, so it is stored as
 /// U+E000 + (unit - 0xD800) in the Private Use Area: 1 UTF-16 unit, non-word, non-space — the same
 /// as the lone surrogate for every later length count and regex. Output code maps it back
-/// (`\udXXX` in dry-run JSON, U+FFFD on the wire).
+/// (`\udXXX` in any JSON via `discord::to_js_json`, U+FFFD when the raw string is written to stdout).
 // shortcut: a real U+E000..U+E3FF character in the input is treated as a lone surrogate on output; switch to a UTF-16 string type if that ever shows up.
 pub const LONE_SURROGATE_BASE: u32 = 0xE000;
 
