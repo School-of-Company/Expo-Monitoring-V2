@@ -3,6 +3,7 @@ pub mod config;
 pub mod discord;
 pub mod grafana;
 pub mod http;
+pub mod js;
 pub mod loki;
 pub mod mask;
 pub mod prometheus;
