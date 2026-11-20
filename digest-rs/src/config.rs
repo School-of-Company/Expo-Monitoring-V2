@@ -1,6 +1,8 @@
 // Port of digest/config.mjs. Numbers stay f64 because the Node version keeps JS numbers
 // (e.g. DIGEST_TOP_N=2.5 is accepted there), and output must match it exactly.
 
+use crate::js::{js_number, js_trim};
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Thresholds {
     pub err5xx_warn_pct: f64,
@@ -34,83 +36,6 @@ pub struct Config {
     pub log_top_n: f64,
     pub min_requests: f64,
     pub thresholds: Thresholds,
-}
-
-/// JS WhiteSpace + LineTerminator (what `String.prototype.trim` and `Number()` strip).
-/// Differs from `char::is_whitespace`: JS includes U+FEFF, excludes U+0085.
-fn is_js_space(c: char) -> bool {
-    matches!(
-        c,
-        '\u{9}'..='\u{D}'
-            | ' '
-            | '\u{A0}'
-            | '\u{1680}'
-            | '\u{2000}'..='\u{200A}'
-            | '\u{2028}'
-            | '\u{2029}'
-            | '\u{202F}'
-            | '\u{205F}'
-            | '\u{3000}'
-            | '\u{FEFF}'
-    )
-}
-
-pub fn js_trim(s: &str) -> &str {
-    s.trim_matches(is_js_space)
-}
-
-/// JS `Number(string)`: "" and whitespace -> 0, hex/octal/binary prefixes, Infinity, else NaN.
-pub fn js_number(s: &str) -> f64 {
-    let t = js_trim(s);
-    if t.is_empty() {
-        return 0.0;
-    }
-    match t {
-        "Infinity" | "+Infinity" => return f64::INFINITY,
-        "-Infinity" => return f64::NEG_INFINITY,
-        _ => {}
-    }
-    let b = t.as_bytes();
-    if b.len() > 2 && b[0] == b'0' {
-        let radix = match b[1] {
-            b'x' | b'X' => 16,
-            b'o' | b'O' => 8,
-            b'b' | b'B' => 2,
-            _ => 0,
-        };
-        if radix != 0 {
-            // shortcut: f64 accumulation can be off by 1 ulp past 2^53, irrelevant for config values
-            return t[2..]
-                .chars()
-                .try_fold(0.0_f64, |acc, c| {
-                    c.to_digit(radix)
-                        .map(|d| acc * f64::from(radix) + f64::from(d))
-                })
-                .unwrap_or(f64::NAN);
-        }
-    }
-    if is_decimal_literal(t) {
-        t.parse().unwrap_or(f64::NAN)
-    } else {
-        f64::NAN
-    }
-}
-
-/// StrDecimalLiteral: [+-] (digits [. digits] | . digits) [e [+-] digits]. Rejects Rust-only forms like "inf"/"nan".
-fn is_decimal_literal(t: &str) -> bool {
-    let t = t.strip_prefix(['+', '-']).unwrap_or(t);
-    let (mantissa, exp) = match t.find(['e', 'E']) {
-        Some(i) => (&t[..i], Some(&t[i + 1..])),
-        None => (t, None),
-    };
-    let (int, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
-    let digits = |s: &str| s.bytes().all(|c| c.is_ascii_digit());
-    let mantissa_ok = digits(int) && digits(frac) && !(int.is_empty() && frac.is_empty());
-    let exp_ok = exp.is_none_or(|e| {
-        let e = e.strip_prefix(['+', '-']).unwrap_or(e);
-        !e.is_empty() && digits(e)
-    });
-    mantissa_ok && exp_ok
 }
 
 fn num(v: Option<&str>, d: f64) -> f64 {
@@ -274,12 +199,6 @@ mod tests {
         ] {
             assert_eq!(cfg(&[("DIGEST_TOP_N", raw)]).top_n, 5.0, "{raw:?}");
         }
-    }
-
-    #[test]
-    fn js_whitespace_rules() {
-        assert_eq!(js_number("\u{FEFF}4"), 4.0);
-        assert!(js_number("\u{85}4").is_nan());
     }
 
     #[test]

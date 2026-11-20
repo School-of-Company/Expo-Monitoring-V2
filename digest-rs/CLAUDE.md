@@ -19,7 +19,7 @@ School-of-Company/Expo-Monitoring의 `digest/`(Node 22 ESM)를 기능·출력·�
 - 배포 파일(Dockerfile, compose 오버레이, CI, README)은 이 레포에 새로 만든다.
 
 ## 이식 함정 (반드시 처리)
-- 문자열 길이·자르기는 UTF-16 코드 유닛 기준. 이모지가 반으로 잘리면 전송은 U+FFFD, dry-run JSON은 `\udXXX` 이스케이프로 Node와 동일하게.
+- 문자열 길이·자르기는 UTF-16 코드 유닛 기준. 이모지가 반으로 잘리면 JSON(dry-run·전송 모두)은 `\udXXX` 이스케이프(`discord::to_js_json`), stdout에 그대로 쓰는 마크다운은 U+FFFD로 Node와 동일하게.
 - `toFixed`/`Math.round` 반올림, `Intl.NumberFormat('en-US')`, JS `Number()`·`String(number)` 규칙.
 - Rust regex는 lookbehind 미지원, `\b`·`\d`·`(?i)`는 기본이 유니코드 → ASCII로 고정.
 - `nextRun`은 chrono-tz로 UTC→로컬만 구하고 JS의 2회 보정 알고리즘을 그대로 옮긴다(DST 결과 동일).
