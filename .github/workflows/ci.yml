@@ -42,3 +42,54 @@ jobs:
 
       - name: 테스트
         run: cargo test --locked
+
+  # Node digest(비교 기준)와 출력·요청·전송 payload가 바이트 단위로 같은지 확인한다.
+  parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 비교 기준 Node digest checkout
+        uses: actions/checkout@v4
+        with:
+          repository: School-of-Company/Expo-Monitoring
+          path: expo-monitoring
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: digest-rs
+
+      - name: Rust 빌드
+        run: cargo build --locked
+        working-directory: digest-rs
+
+      - name: Node digest 자체 테스트 (기준이 깨지지 않았는지)
+        run: |
+          node --test "expo-monitoring/digest/*.test.mjs"
+          node expo-monitoring/dev/verify-digest.mjs
+
+      - name: Node·Rust 동등성
+        run: node dev/verify-digest-parity.mjs
+        env:
+          EXPO_MONITORING_DIR: expo-monitoring
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 이미지 빌드
+        run: docker build -t digest-rs digest-rs
+
+      - name: 컨테이너 dry-run
+        run: |
+          docker run --rm digest-rs digest once daily --dry-run | grep -q 'markdown preview'
+          docker image ls digest-rs --format '이미지 크기: {{.Size}}'
